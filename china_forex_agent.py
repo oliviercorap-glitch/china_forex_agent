@@ -1,6 +1,6 @@
 """
 Agent de veille des taux de change – CFO Chine
-Version enrichie avec données officielles (akshare) - CORRIGÉE
+Version enrichie avec données officielles (akshare) - CORRECTION JSON
 ==================================================
 Sources :
 - Taux de marché : Frankfurter (API gratuite, base ECB)
@@ -119,53 +119,33 @@ def calculate_variation(current, previous):
     return (current - previous) / previous * 100
 
 # ------------------------------------------------------------
-# 2. Données officielles PBOC (via akshare) - CORRIGÉE
+# 2. Données officielles PBOC (via akshare) - CORRIGÉE (JSON serializable)
 # ------------------------------------------------------------
 def get_latest_pboc_rate(currency_cn="美元"):
     """
     Récupère le dernier taux de référence central PBOC pour une devise donnée.
     currency_cn : nom de la devise en chinois (ex: "美元" pour USD, "欧元" pour EUR)
-    Retourne un tuple (taux, date) ou (None, None) si indisponible.
+    Retourne un tuple (taux, date_str) où date_str est une chaîne ISO (YYYY-MM-DD).
     """
     if not HAS_AKSHARE:
         log.warning("akshare non installé. Impossible de récupérer les données PBOC.")
         return None, None
     
     try:
-        # La fonction renvoie un DataFrame avec colonnes: 日期, 现汇买入价, 现汇卖出价, 现钞买入价, 现钞卖出价, 央行中间价
         df = ak.currency_boc_sina(symbol=currency_cn)
         if df is not None and len(df) > 0:
-            # Prendre la ligne la plus récente (première car triée par date décroissante)
             latest = df.iloc[0]
-            date_str = latest['日期']
+            # Convertir la date en chaîne (peut être pandas.Timestamp ou datetime.date)
+            date_val = latest['日期']
+            if hasattr(date_val, 'strftime'):
+                date_str = date_val.strftime("%Y-%m-%d")
+            else:
+                date_str = str(date_val)
             mid_rate = latest['央行中间价']
             log.info(f"PBOC {currency_cn} mid-rate le {date_str}: {mid_rate}")
             return float(mid_rate), date_str
     except Exception as e:
         log.warning(f"Erreur récupération PBOC pour {currency_cn}: {e}")
-    return None, None
-
-def get_pboc_rate_for_date(currency_cn="美元", target_date=None):
-    """
-    Récupère le taux PBOC pour une date spécifique (si disponible dans l'historique).
-    Par défaut, prend la dernière date connue.
-    """
-    if not HAS_AKSHARE:
-        return None, None
-    try:
-        df = ak.currency_boc_sina(symbol=currency_cn)
-        if df is not None and len(df) > 0:
-            if target_date:
-                # Convertir target_date en string YYYY-MM-DD pour comparer
-                target_str = target_date if isinstance(target_date, str) else target_date.strftime("%Y-%m-%d")
-                row = df[df['日期'] == target_str]
-                if not row.empty:
-                    return float(row.iloc[0]['央行中间价']), target_str
-            # Sinon, renvoyer le plus récent
-            latest = df.iloc[0]
-            return float(latest['央行中间价']), latest['日期']
-    except Exception as e:
-        log.warning(f"Erreur PBOC pour {currency_cn} à {target_date}: {e}")
     return None, None
 
 def load_pboc_history():
@@ -184,7 +164,7 @@ def save_pboc_history(history):
 def update_pboc_history():
     """
     Récupère les derniers taux PBOC pour les devises majeures (USD, EUR, JPY, GBP, HKD)
-    et les stocke dans l'historique.
+    et les stocke dans l'historique. La date est convertie en chaîne.
     """
     pboc_history = load_pboc_history()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -200,10 +180,9 @@ def update_pboc_history():
     
     pboc_rates = {}
     for ccy, ccy_cn in currency_map.items():
-        rate, date_retrieved = get_latest_pboc_rate(ccy_cn)
+        rate, date_str = get_latest_pboc_rate(ccy_cn)
         if rate:
-            pboc_rates[ccy] = {"rate": rate, "date": date_retrieved}
-    
+            pboc_rates[ccy] = {"rate": rate, "date": date_str}  # date_str est déjà une chaîne
     if pboc_rates:
         pboc_history[today] = pboc_rates
         # Garder 60 jours
@@ -212,7 +191,6 @@ def update_pboc_history():
             del pboc_history[oldest]
         save_pboc_history(pboc_history)
         log.info(f"Historique PBOC mis à jour : {len(pboc_rates)} devise(s)")
-    
     return pboc_rates
 
 def get_pboc_rate_from_history(date):
@@ -229,12 +207,7 @@ def compare_with_pboc(current_rates, pboc_rates):
     for ccy, pboc_data in pboc_rates.items():
         pboc_rate = pboc_data.get("rate")
         if pboc_rate and ccy in current_rates:
-            # Pour comparer correctement, il faut utiliser le taux USD/CNY ou EUR/CNY depuis le marché
-            # Mais ici on compare directement le taux de marché (EUR/USD, EUR/CNY, etc.) avec le taux PBOC ? Non, le PBOC donne CNY contre devise.
-            # Le taux PBOC est exprimé en "1 USD = X CNY", etc.
-            # Notre taux de marché pour CNY (EUR/CNY) n'est pas directement comparable.
-            # On choisit de comparer le taux USD/CNY implicite.
-            # Calculons USD/CNY à partir des taux EUR/USD et EUR/CNY.
+            # Calcul du taux de marché USD/CNY implicite
             if "USD" in current_rates and "CNY" in current_rates:
                 usd_cny_market = current_rates["CNY"] / current_rates["USD"]
                 deviation_pct = (usd_cny_market - pboc_rate) / pboc_rate * 100
@@ -246,7 +219,7 @@ def compare_with_pboc(current_rates, pboc_rates):
                         "deviation_pct": deviation_pct,
                         "pair": "USD/CNY"
                     })
-            # Pour EUR/CNY, on peut comparer directement le taux marché EUR/CNY
+            # Pour EUR/CNY, comparaison directe
             if ccy == "EUR" and "CNY" in current_rates:
                 eur_cny_market = current_rates["CNY"]
                 pboc_eur_rate = pboc_rate  # c'est EUR/CNY
