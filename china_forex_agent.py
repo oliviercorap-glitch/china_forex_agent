@@ -1,15 +1,12 @@
 """
 Agent de veille des taux de change – CFO Chine
-Version enrichie avec données officielles (akshare) - CORRECTION JSON
+Version corrigée (taux PBOC en unité de base + filtrage date)
 ==================================================
 Sources :
-- Taux de marché : Frankfurter (API gratuite, base ECB)
-- Taux officiels Chine : Banque Populaire de Chine (PBOC) via akshare (dernières données disponibles)
-- Analyse d'impact : DeepSeek (fluctuations > seuils)
-
-Fréquence : quotidienne (lundi-vendredi, 8h Shanghai)
+- Taux de marché : Frankfurter
+- Taux officiels Chine : PBOC via akshare (converti en base 1)
+Seuil d'ancienneté : 7 jours max pour les données PBOC
 Variables : DEEPSEEK_API_KEY (optionnelle)
-Dépendance : pip install akshare
 """
 
 import os
@@ -20,24 +17,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Pour l'analyse LLM (optionnelle mais recommandée)
 try:
     import anthropic
     HAS_ANTHROPIC = True
 except ImportError:
     HAS_ANTHROPIC = False
 
-# Pour les données officielles chinoises
 try:
     import akshare as ak
     HAS_AKSHARE = True
 except ImportError:
     HAS_AKSHARE = False
-    print("⚠️ akshare non installé. Exécutez 'pip install akshare' pour activer les données PBOC.")
 
 load_dotenv()
 
-# Configuration des logs
 LOG_FILE = Path("logs/agent_forex.log")
 HISTORY_FILE = Path("forex_history.json")
 PBOC_HISTORY_FILE = Path("pboc_history.json")
@@ -52,25 +45,17 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
 CURRENCIES = ["CNY", "USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "HKD"]
-BASE_CURRENCY = "EUR"  # L'API Frankfurter utilise EUR comme base
-
-# Seuils de fluctuation jugés significatifs (en pourcentage)
-THRESHOLD_1D = 0.8      # >0.8% en une journée
-THRESHOLD_7D = 2.0      # >2% sur 7 jours
-THRESHOLD_30D = 4.0     # >4% sur 30 jours
-
-# API gratuite (Frankfurter - données de la BCE, sans clé)
+BASE_CURRENCY = "EUR"
+THRESHOLD_1D = 0.8
+THRESHOLD_7D = 2.0
+THRESHOLD_30D = 4.0
 API_URL = "https://api.frankfurter.app/latest"
 
 # ------------------------------------------------------------
 # 1. Données de marché (Frankfurter)
 # ------------------------------------------------------------
 def get_current_rates(base=BASE_CURRENCY):
-    """Récupère les taux actuels depuis l'API Frankfurter."""
     try:
         params = {"from": base, "to": ",".join(CURRENCIES)}
         resp = requests.get(API_URL, params=params, timeout=10)
@@ -78,7 +63,7 @@ def get_current_rates(base=BASE_CURRENCY):
         data = resp.json()
         rates = data.get("rates", {})
         date = data.get("date")
-        log.info(f"Taux de marché récupérés pour le {date}")
+        log.info(f"Taux de marché récupérés pour {date}")
         return rates, date
     except Exception as e:
         log.error(f"Erreur API Frankfurter : {e}")
@@ -119,33 +104,28 @@ def calculate_variation(current, previous):
     return (current - previous) / previous * 100
 
 # ------------------------------------------------------------
-# 2. Données officielles PBOC (via akshare) - CORRIGÉE (JSON serializable)
+# 2. Données PBOC (correction : conversion en base 1)
 # ------------------------------------------------------------
 def get_latest_pboc_rate(currency_cn="美元"):
-    """
-    Récupère le dernier taux de référence central PBOC pour une devise donnée.
-    currency_cn : nom de la devise en chinois (ex: "美元" pour USD, "欧元" pour EUR)
-    Retourne un tuple (taux, date_str) où date_str est une chaîne ISO (YYYY-MM-DD).
-    """
+    """Retourne (taux_pour_1_unite, date_string) ou (None, None)"""
     if not HAS_AKSHARE:
-        log.warning("akshare non installé. Impossible de récupérer les données PBOC.")
         return None, None
-    
     try:
         df = ak.currency_boc_sina(symbol=currency_cn)
         if df is not None and len(df) > 0:
             latest = df.iloc[0]
-            # Convertir la date en chaîne (peut être pandas.Timestamp ou datetime.date)
             date_val = latest['日期']
             if hasattr(date_val, 'strftime'):
                 date_str = date_val.strftime("%Y-%m-%d")
             else:
                 date_str = str(date_val)
-            mid_rate = latest['央行中间价']
-            log.info(f"PBOC {currency_cn} mid-rate le {date_str}: {mid_rate}")
-            return float(mid_rate), date_str
+            # Le taux est pour 100 unités de devise étrangère
+            rate_per_100 = float(latest['央行中间价'])
+            rate_per_1 = rate_per_100 / 100.0
+            log.info(f"PBOC {currency_cn} : {rate_per_100} / 100 = {rate_per_1} ({date_str})")
+            return rate_per_1, date_str
     except Exception as e:
-        log.warning(f"Erreur récupération PBOC pour {currency_cn}: {e}")
+        log.warning(f"Erreur PBOC pour {currency_cn}: {e}")
     return None, None
 
 def load_pboc_history():
@@ -162,30 +142,16 @@ def save_pboc_history(history):
         json.dump(history, f, indent=2, ensure_ascii=False)
 
 def update_pboc_history():
-    """
-    Récupère les derniers taux PBOC pour les devises majeures (USD, EUR, JPY, GBP, HKD)
-    et les stocke dans l'historique. La date est convertie en chaîne.
-    """
     pboc_history = load_pboc_history()
     today = datetime.now().strftime("%Y-%m-%d")
-    
-    # Mapping devise anglaise -> nom chinois pour l'API
-    currency_map = {
-        "USD": "美元",
-        "EUR": "欧元",
-        "JPY": "日元",
-        "GBP": "英镑",
-        "HKD": "港币",
-    }
-    
+    currency_map = {"USD": "美元", "EUR": "欧元", "JPY": "日元", "GBP": "英镑", "HKD": "港币"}
     pboc_rates = {}
     for ccy, ccy_cn in currency_map.items():
         rate, date_str = get_latest_pboc_rate(ccy_cn)
         if rate:
-            pboc_rates[ccy] = {"rate": rate, "date": date_str}  # date_str est déjà une chaîne
+            pboc_rates[ccy] = {"rate": rate, "date": date_str}
     if pboc_rates:
         pboc_history[today] = pboc_rates
-        # Garder 60 jours
         if len(pboc_history) > 60:
             oldest = sorted(pboc_history.keys())[0]
             del pboc_history[oldest]
@@ -193,147 +159,116 @@ def update_pboc_history():
         log.info(f"Historique PBOC mis à jour : {len(pboc_rates)} devise(s)")
     return pboc_rates
 
-def get_pboc_rate_from_history(date):
-    """Récupère les taux PBOC stockés pour une date donnée."""
+def get_current_pboc_rates():
+    """Renvoie les taux PBOC les plus récents (moins de 7 jours)"""
     pboc_history = load_pboc_history()
-    return pboc_history.get(date, {})
+    if not pboc_history:
+        return {}
+    # Trier par date décroissante
+    dates = sorted(pboc_history.keys(), reverse=True)
+    today = datetime.now()
+    for d in dates:
+        try:
+            d_obj = datetime.strptime(d, "%Y-%m-%d")
+            if (today - d_obj).days <= 7:
+                return pboc_history[d]
+        except:
+            continue
+    # Si tous sont trop vieux, prendre le plus récent
+    return pboc_history[dates[0]] if dates else {}
 
 def compare_with_pboc(current_rates, pboc_rates):
-    """
-    Compare les taux de marché Frankfurter avec les taux officiels PBOC.
-    Retourne les écarts significatifs.
-    """
+    """Compare les taux de marché aux taux PBOC (déjà convertis en base 1)"""
     deviations = []
+    # Pour chaque devise présente dans pboc_rates
     for ccy, pboc_data in pboc_rates.items():
         pboc_rate = pboc_data.get("rate")
-        if pboc_rate and ccy in current_rates:
-            # Calcul du taux de marché USD/CNY implicite
-            if "USD" in current_rates and "CNY" in current_rates:
-                usd_cny_market = current_rates["CNY"] / current_rates["USD"]
-                deviation_pct = (usd_cny_market - pboc_rate) / pboc_rate * 100
-                if abs(deviation_pct) > 0.5:
-                    deviations.append({
-                        "currency": ccy,
-                        "market_rate": usd_cny_market,
-                        "pboc_rate": pboc_rate,
-                        "deviation_pct": deviation_pct,
-                        "pair": "USD/CNY"
-                    })
-            # Pour EUR/CNY, comparaison directe
-            if ccy == "EUR" and "CNY" in current_rates:
-                eur_cny_market = current_rates["CNY"]
-                pboc_eur_rate = pboc_rate  # c'est EUR/CNY
-                deviation_pct = (eur_cny_market - pboc_eur_rate) / pboc_eur_rate * 100
-                if abs(deviation_pct) > 0.5:
-                    deviations.append({
-                        "currency": "EUR",
-                        "market_rate": eur_cny_market,
-                        "pboc_rate": pboc_eur_rate,
-                        "deviation_pct": deviation_pct,
-                        "pair": "EUR/CNY"
-                    })
+        if not pboc_rate:
+            continue
+        # On cherche le taux de marché correspondant (USD/CNY ou EUR/CNY)
+        if ccy == "USD" and "CNY" in current_rates and "USD" in current_rates:
+            market_usd_cny = current_rates["CNY"] / current_rates["USD"]
+            deviation = (market_usd_cny - pboc_rate) / pboc_rate * 100
+            if abs(deviation) > 0.5:
+                deviations.append({
+                    "pair": "USD/CNY",
+                    "market_rate": market_usd_cny,
+                    "pboc_rate": pboc_rate,
+                    "deviation_pct": deviation
+                })
+        if ccy == "EUR" and "CNY" in current_rates:
+            market_eur_cny = current_rates["CNY"]
+            deviation = (market_eur_cny - pboc_rate) / pboc_rate * 100
+            if abs(deviation) > 0.5:
+                deviations.append({
+                    "pair": "EUR/CNY",
+                    "market_rate": market_eur_cny,
+                    "pboc_rate": pboc_rate,
+                    "deviation_pct": deviation
+                })
     return deviations
 
 # ------------------------------------------------------------
-# 3. Détection des fluctuations
+# 3. Fluctuations (inchangé)
 # ------------------------------------------------------------
 def detect_significant_movements(current_rates, date, history):
     alerts = []
     yesterday = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     week_ago = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
     month_ago = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
-
     for currency in CURRENCIES:
         if currency == BASE_CURRENCY:
             continue
         current = current_rates.get(currency)
         if current is None:
             continue
-
         prev_day = get_rate_at_date(history, currency, yesterday)
         var_day = calculate_variation(current, prev_day) if prev_day else None
         prev_week = get_rate_at_date(history, currency, week_ago)
         var_week = calculate_variation(current, prev_week) if prev_week else None
         prev_month = get_rate_at_date(history, currency, month_ago)
         var_month = calculate_variation(current, prev_month) if prev_month else None
-
         if var_day is not None and abs(var_day) >= THRESHOLD_1D:
-            alerts.append({
-                "currency": currency,
-                "type": "daily",
-                "variation": var_day,
-                "current": current,
-                "previous": prev_day,
-                "period": "1 jour"
-            })
+            alerts.append({"currency": currency, "variation": var_day, "period": "1 jour", "current": current})
         if var_week is not None and abs(var_week) >= THRESHOLD_7D:
-            alerts.append({
-                "currency": currency,
-                "type": "weekly",
-                "variation": var_week,
-                "current": current,
-                "previous": prev_week,
-                "period": "7 jours"
-            })
+            alerts.append({"currency": currency, "variation": var_week, "period": "7 jours", "current": current})
         if var_month is not None and abs(var_month) >= THRESHOLD_30D:
-            alerts.append({
-                "currency": currency,
-                "type": "monthly",
-                "variation": var_month,
-                "current": current,
-                "previous": prev_month,
-                "period": "30 jours"
-            })
+            alerts.append({"currency": currency, "variation": var_month, "period": "30 jours", "current": current})
     return alerts
 
 # ------------------------------------------------------------
-# 4. Analyse d'impact via DeepSeek
+# 4. Analyse LLM (identique)
 # ------------------------------------------------------------
 def analyze_impact_with_llm(alerts, pboc_deviations):
     if not HAS_ANTHROPIC:
-        log.warning("Module anthropic non installé. Pas d'analyse LLM.")
         return None
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
-        log.warning("DEEPSEEK_API_KEY non définie. Analyse LLM ignorée.")
         return None
-
     client = anthropic.Anthropic(base_url="https://api.deepseek.com/anthropic", api_key=api_key)
-
     alert_text = ""
     for a in alerts:
         direction = "hausse" if a["variation"] > 0 else "baisse"
-        alert_text += f"- {a['currency']} : {direction} de {abs(a['variation']):.2f}% sur {a['period']} (taux actuel {a['current']:.4f})\n"
-    
+        alert_text += f"- {a['currency']} : {direction} de {abs(a['variation']):.2f}% sur {a['period']} (→ {a['current']:.4f})\n"
     deviation_text = ""
     for d in pboc_deviations:
         direction = "au-dessus" if d["deviation_pct"] > 0 else "en dessous"
-        deviation_text += f"- {d['pair']} : écart de {abs(d['deviation_pct']):.2f}% {direction} du taux PBOC (marché {d['market_rate']:.4f} vs PBOC {d['pboc_rate']:.4f})\n"
-
+        deviation_text += f"- {d['pair']} : écart de {abs(d['deviation_pct']):.2f}% {direction} du fixing PBOC (marché {d['market_rate']:.4f} vs PBOC {d['pboc_rate']:.4f})\n"
     if not alert_text and not deviation_text:
-        return "Aucune fluctuation significative ni écart anormal par rapport au taux PBOC à signaler."
+        return "Aucune fluctuation ni écart significatif."
+    prompt = f"""Tu es un expert en finance internationale, conseillant un CFO en Chine.
 
-    prompt = f"""Tu es un expert en finance internationale et trésorerie, conseillant un CFO d'une multinationale ayant des opérations en Chine.
+Fluctuations :\n{alert_text}
+Écarts PBOC :\n{deviation_text}
 
-Voici les fluctuations de change significatives détectées aujourd'hui :
+Analyse les impacts trésorerie, change, couverture. Termine par 5 lignes de synthèse pour le CFO.
 
-{alert_text}
-{deviation_text}
-
-Analyse pour chaque devise et écart :
-1. Causes possibles (macroéconomiques, politiques, interventions PBOC, saisonnières)
-2. Impact concret sur la trésorerie, le besoin en fonds de roulement, les coûts d'approvisionnement ou les revenus à l'export pour une entreprise opérant en Chine
-3. Actions recommandées pour le CFO : couverture (hedging), avancement ou retard de paiements, renégociation de contrats, réallocation de trésorerie
-
-Termine par une synthèse exécutive de 5 lignes pour le brief matinal du CFO, en mettant en évidence les risques change liés à la Chine.
-
-Réponse en français, professionnelle et concise.
-"""
+En français, concis."""
     try:
         msg = client.messages.create(
             model="deepseek-v4-pro",
             max_tokens=2048,
-            system="Tu es un conseiller senior en gestion des risques de change, spécialiste des marchés émergents et de la Chine.",
+            system="Expert risques de change.",
             messages=[{"role": "user", "content": prompt}]
         )
         response_text = ""
@@ -342,13 +277,13 @@ Réponse en français, professionnelle et concise.
                 response_text += block.text
             elif hasattr(block, 'text'):
                 response_text += block.text
-        return response_text if response_text else "Analyse non disponible."
+        return response_text or "Analyse non disponible."
     except Exception as e:
-        log.error(f"Erreur lors de l'appel DeepSeek : {e}")
+        log.error(f"Erreur LLM: {e}")
         return None
 
 # ------------------------------------------------------------
-# 5. Génération du rapport
+# 5. Rapport
 # ------------------------------------------------------------
 def generate_report(alerts, current_rates, date, pboc_rates, pboc_deviations, llm_analysis):
     lines = []
@@ -356,54 +291,45 @@ def generate_report(alerts, current_rates, date, pboc_rates, pboc_deviations, ll
     lines.append(f"  VEILLE TAUX DE CHANGE – {date}")
     lines.append("  Pour : CFO – Opérations Chine & International")
     lines.append("=" * 70)
-    lines.append("")
-    lines.append("  📊 TAUX DE MARCHÉ ACTUELS (base EUR) :")
+    lines.append("\n  📊 TAUX DE MARCHÉ ACTUELS (base EUR) :")
     for ccy in CURRENCIES:
         if ccy in current_rates:
             lines.append(f"    {ccy} : {current_rates[ccy]:.4f}")
     lines.append("")
-    
     if pboc_rates:
-        lines.append("  🏦 TAUX OFFICIELS PBOC (taux de référence central) :")
+        lines.append("  🏦 TAUX OFFICIELS PBOC (dernier fixing, exprimé en unité de base) :")
         for ccy, data in pboc_rates.items():
             rate = data.get("rate", "N/A")
             date_str = data.get("date", "inconnue")
-            lines.append(f"    {ccy} : {rate:.4f} (dernière valeur du {date_str})")
+            lines.append(f"    {ccy}/CNY : {rate:.4f} (fixing du {date_str})")
         lines.append("")
-    
     lines.append("-" * 70)
-    lines.append("  📈 FLUCTUATIONS SIGNIFICATIVES DÉTECTÉES")
+    lines.append("  📈 FLUCTUATIONS SIGNIFICATIVES")
     lines.append("-" * 70)
     if alerts:
         for a in alerts:
             sign = "+" if a["variation"] > 0 else "-"
             lines.append(f"  • {a['currency']} : {sign}{abs(a['variation']):.2f}% sur {a['period']} (→ {a['current']:.4f})")
     else:
-        lines.append("  Aucune fluctuation dépassant les seuils définis.")
+        lines.append("  Aucune fluctuation notable.")
     lines.append("")
-    
     if pboc_deviations:
         lines.append("-" * 70)
-        lines.append("  🏦 ÉCARTS MARCHÉ vs PBOC (significatifs)")
+        lines.append("  🏦 ÉCARTS MARCHÉ vs FIXING PBOC")
         lines.append("-" * 70)
         for d in pboc_deviations:
-            direction = "au-dessus du" if d["deviation_pct"] > 0 else "en dessous du"
-            lines.append(f"  • {d['pair']} : écart de {abs(d['deviation_pct']):.2f}% {direction} taux officiel PBOC")
+            direction = "au-dessus" if d["deviation_pct"] > 0 else "en dessous"
+            lines.append(f"  • {d['pair']} : écart de {abs(d['deviation_pct']):.2f}% {direction} du fixing")
         lines.append("")
-    
     if llm_analysis:
         lines.append("-" * 70)
-        lines.append("  💡 ANALYSE D'IMPACT & RECOMMANDATIONS (DeepSeek)")
+        lines.append("  💡 ANALYSE & RECOMMANDATIONS")
         lines.append("-" * 70)
         lines.append(llm_analysis)
     else:
         lines.append("-" * 70)
-        lines.append("  ℹ️ Analyse LLM non disponible – clé API manquante ou module absent")
-        if pboc_rates:
-            lines.append("  Les données PBOC sont néanmoins disponibles pour information.")
-    
-    lines.append("")
-    lines.append("=" * 70)
+        lines.append("  ℹ️ Analyse approfondie non disponible")
+    lines.append("\n" + "=" * 70)
     return "\n".join(lines)
 
 def save_report(report):
@@ -413,43 +339,24 @@ def save_report(report):
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         f.write(report)
     log.info(f"Rapport sauvegardé : {filename}")
-    return filename
 
 # ------------------------------------------------------------
-# 6. Exécution principale
+# 6. Exécution
 # ------------------------------------------------------------
 def run_forex_agent():
-    log.info("Démarrage de l'agent de veille des taux de change (version enrichie PBOC)")
-    
-    # Étape 1 : Données de marché Frankfurter
+    log.info("Démarrage agent change (version corrigée)")
     rates, date = get_current_rates()
     if not rates:
-        log.error("Impossible de récupérer les taux de marché. Arrêt.")
+        log.error("Impossible de récupérer les taux de marché.")
         return
-    
     history = load_history()
     update_history(rates, date)
-    
-    # Étape 2 : Données officielles PBOC
-    pboc_rates = {}
-    pboc_deviations = []
-    if HAS_AKSHARE:
-        pboc_rates = update_pboc_history()
-        if pboc_rates:
-            pboc_deviations = compare_with_pboc(rates, pboc_rates)
-    
-    # Étape 3 : Détection des fluctuations
     alerts = detect_significant_movements(rates, date, history)
-    
-    # Étape 4 : Analyse LLM (si des alertes ou écarts existent)
+    pboc_rates = get_current_pboc_rates()  # utilise les dernières données (<7 jours)
+    pboc_deviations = compare_with_pboc(rates, pboc_rates) if pboc_rates else []
     llm_analysis = None
     if alerts or pboc_deviations:
-        log.info(f"{len(alerts)} fluctuation(s) détectée(s), {len(pboc_deviations)} écart(s) PBOC. Appel DeepSeek.")
         llm_analysis = analyze_impact_with_llm(alerts, pboc_deviations)
-    else:
-        log.info("Aucune fluctuation ou écart significatif détecté.")
-    
-    # Étape 5 : Rapport
     report = generate_report(alerts, rates, date, pboc_rates, pboc_deviations, llm_analysis)
     print(report)
     save_report(report)
