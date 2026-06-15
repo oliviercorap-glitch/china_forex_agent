@@ -1,0 +1,66 @@
+name: Veille Taux de Change Chine (PBOC)
+
+on:
+  schedule:
+    # 8h00 Shanghai (UTC+8 = 00:00 UTC) du lundi au vendredi
+    - cron: '0 0 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forex-veille:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Restaurer l'historique des taux (marché)
+        uses: actions/cache@v3
+        with:
+          path: forex_history.json
+          key: forex-history-${{ github.run_id }}
+          restore-keys: |
+            forex-history-
+
+      - name: Restaurer l'historique PBOC
+        uses: actions/cache@v3
+        with:
+          path: pboc_history.json
+          key: pboc-history-${{ github.run_id }}
+          restore-keys: |
+            pboc-history-
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les dépendances
+        run: |
+          pip install akshare requests anthropic python-dotenv
+
+      - name: Lancer l'agent
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python china_forex_agent.py
+
+      - name: Sauvegarder l'historique des taux (marché)
+        uses: actions/cache@v3
+        with:
+          path: forex_history.json
+          key: forex-history-${{ github.run_id }}
+
+      - name: Sauvegarder l'historique PBOC
+        uses: actions/cache@v3
+        with:
+          path: pboc_history.json
+          key: pboc-history-${{ github.run_id }}
+
+      - name: Sauvegarder le rapport
+        uses: actions/upload-artifact@v4
+        with:
+          name: forex-chine-${{ github.run_number }}
+          path: rapports/forex_chine_*.txt
+          retention-days: 90
