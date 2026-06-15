@@ -1,10 +1,10 @@
 """
 Agent de veille des taux de change – CFO Chine
-Version enrichie avec données officielles (akshare)
+Version enrichie avec données officielles (akshare) - CORRIGÉE
 ==================================================
 Sources :
 - Taux de marché : Frankfurter (API gratuite, base ECB)
-- Taux officiels Chine : Banque Populaire de Chine (PBOC) via akshare
+- Taux officiels Chine : Banque Populaire de Chine (PBOC) via akshare (dernières données disponibles)
 - Analyse d'impact : DeepSeek (fluctuations > seuils)
 
 Fréquence : quotidienne (lundi-vendredi, 8h Shanghai)
@@ -119,32 +119,54 @@ def calculate_variation(current, previous):
     return (current - previous) / previous * 100
 
 # ------------------------------------------------------------
-# 2. Données officielles PBOC (via akshare)
+# 2. Données officielles PBOC (via akshare) - CORRIGÉE
 # ------------------------------------------------------------
-def get_pboc_mid_rate(currency_cn="美元", date_str=None):
+def get_latest_pboc_rate(currency_cn="美元"):
     """
-    Récupère le taux de référence central PBOC pour une devise donnée.
+    Récupère le dernier taux de référence central PBOC pour une devise donnée.
     currency_cn : nom de la devise en chinois (ex: "美元" pour USD, "欧元" pour EUR)
-    date_str : format "YYYYMMDD"
+    Retourne un tuple (taux, date) ou (None, None) si indisponible.
     """
     if not HAS_AKSHARE:
         log.warning("akshare non installé. Impossible de récupérer les données PBOC.")
-        return None
-    
-    if date_str is None:
-        date_str = datetime.now().strftime("%Y%m%d")
+        return None, None
     
     try:
-        # Interface akshare pour les taux historiques de la Banque de Chine
-        df = ak.currency_boc_sina(symbol=currency_cn, date=date_str)
+        # La fonction renvoie un DataFrame avec colonnes: 日期, 现汇买入价, 现汇卖出价, 现钞买入价, 现钞卖出价, 央行中间价
+        df = ak.currency_boc_sina(symbol=currency_cn)
         if df is not None and len(df) > 0:
-            # La colonne '央行中间价' contient le taux de référence central
-            mid_rate = df.iloc[0]['央行中间价']
+            # Prendre la ligne la plus récente (première car triée par date décroissante)
+            latest = df.iloc[0]
+            date_str = latest['日期']
+            mid_rate = latest['央行中间价']
             log.info(f"PBOC {currency_cn} mid-rate le {date_str}: {mid_rate}")
-            return float(mid_rate)
+            return float(mid_rate), date_str
     except Exception as e:
         log.warning(f"Erreur récupération PBOC pour {currency_cn}: {e}")
-    return None
+    return None, None
+
+def get_pboc_rate_for_date(currency_cn="美元", target_date=None):
+    """
+    Récupère le taux PBOC pour une date spécifique (si disponible dans l'historique).
+    Par défaut, prend la dernière date connue.
+    """
+    if not HAS_AKSHARE:
+        return None, None
+    try:
+        df = ak.currency_boc_sina(symbol=currency_cn)
+        if df is not None and len(df) > 0:
+            if target_date:
+                # Convertir target_date en string YYYY-MM-DD pour comparer
+                target_str = target_date if isinstance(target_date, str) else target_date.strftime("%Y-%m-%d")
+                row = df[df['日期'] == target_str]
+                if not row.empty:
+                    return float(row.iloc[0]['央行中间价']), target_str
+            # Sinon, renvoyer le plus récent
+            latest = df.iloc[0]
+            return float(latest['央行中间价']), latest['日期']
+    except Exception as e:
+        log.warning(f"Erreur PBOC pour {currency_cn} à {target_date}: {e}")
+    return None, None
 
 def load_pboc_history():
     if PBOC_HISTORY_FILE.exists():
@@ -161,7 +183,7 @@ def save_pboc_history(history):
 
 def update_pboc_history():
     """
-    Récupère les taux PBOC pour les devises majeures (USD, EUR, JPY, GBP, HKD)
+    Récupère les derniers taux PBOC pour les devises majeures (USD, EUR, JPY, GBP, HKD)
     et les stocke dans l'historique.
     """
     pboc_history = load_pboc_history()
@@ -178,9 +200,9 @@ def update_pboc_history():
     
     pboc_rates = {}
     for ccy, ccy_cn in currency_map.items():
-        rate = get_pboc_mid_rate(ccy_cn)
+        rate, date_retrieved = get_latest_pboc_rate(ccy_cn)
         if rate:
-            pboc_rates[ccy] = rate
+            pboc_rates[ccy] = {"rate": rate, "date": date_retrieved}
     
     if pboc_rates:
         pboc_history[today] = pboc_rates
@@ -193,24 +215,50 @@ def update_pboc_history():
     
     return pboc_rates
 
+def get_pboc_rate_from_history(date):
+    """Récupère les taux PBOC stockés pour une date donnée."""
+    pboc_history = load_pboc_history()
+    return pboc_history.get(date, {})
+
 def compare_with_pboc(current_rates, pboc_rates):
     """
     Compare les taux de marché Frankfurter avec les taux officiels PBOC.
     Retourne les écarts significatifs.
     """
     deviations = []
-    for ccy in pboc_rates:
-        if ccy in current_rates:
-            market_rate = current_rates[ccy]
-            pboc_rate = pboc_rates[ccy]
-            deviation_pct = (market_rate - pboc_rate) / pboc_rate * 100
-            if abs(deviation_pct) > 0.5:  # Écart > 0.5% considéré comme significatif
-                deviations.append({
-                    "currency": ccy,
-                    "market_rate": market_rate,
-                    "pboc_rate": pboc_rate,
-                    "deviation_pct": deviation_pct
-                })
+    for ccy, pboc_data in pboc_rates.items():
+        pboc_rate = pboc_data.get("rate")
+        if pboc_rate and ccy in current_rates:
+            # Pour comparer correctement, il faut utiliser le taux USD/CNY ou EUR/CNY depuis le marché
+            # Mais ici on compare directement le taux de marché (EUR/USD, EUR/CNY, etc.) avec le taux PBOC ? Non, le PBOC donne CNY contre devise.
+            # Le taux PBOC est exprimé en "1 USD = X CNY", etc.
+            # Notre taux de marché pour CNY (EUR/CNY) n'est pas directement comparable.
+            # On choisit de comparer le taux USD/CNY implicite.
+            # Calculons USD/CNY à partir des taux EUR/USD et EUR/CNY.
+            if "USD" in current_rates and "CNY" in current_rates:
+                usd_cny_market = current_rates["CNY"] / current_rates["USD"]
+                deviation_pct = (usd_cny_market - pboc_rate) / pboc_rate * 100
+                if abs(deviation_pct) > 0.5:
+                    deviations.append({
+                        "currency": ccy,
+                        "market_rate": usd_cny_market,
+                        "pboc_rate": pboc_rate,
+                        "deviation_pct": deviation_pct,
+                        "pair": "USD/CNY"
+                    })
+            # Pour EUR/CNY, on peut comparer directement le taux marché EUR/CNY
+            if ccy == "EUR" and "CNY" in current_rates:
+                eur_cny_market = current_rates["CNY"]
+                pboc_eur_rate = pboc_rate  # c'est EUR/CNY
+                deviation_pct = (eur_cny_market - pboc_eur_rate) / pboc_eur_rate * 100
+                if abs(deviation_pct) > 0.5:
+                    deviations.append({
+                        "currency": "EUR",
+                        "market_rate": eur_cny_market,
+                        "pboc_rate": pboc_eur_rate,
+                        "deviation_pct": deviation_pct,
+                        "pair": "EUR/CNY"
+                    })
     return deviations
 
 # ------------------------------------------------------------
@@ -287,7 +335,7 @@ def analyze_impact_with_llm(alerts, pboc_deviations):
     deviation_text = ""
     for d in pboc_deviations:
         direction = "au-dessus" if d["deviation_pct"] > 0 else "en dessous"
-        deviation_text += f"- {d['currency']} : écart de {abs(d['deviation_pct']):.2f}% {direction} du taux PBOC (marché {d['market_rate']:.4f} vs PBOC {d['pboc_rate']:.4f})\n"
+        deviation_text += f"- {d['pair']} : écart de {abs(d['deviation_pct']):.2f}% {direction} du taux PBOC (marché {d['market_rate']:.4f} vs PBOC {d['pboc_rate']:.4f})\n"
 
     if not alert_text and not deviation_text:
         return "Aucune fluctuation significative ni écart anormal par rapport au taux PBOC à signaler."
@@ -344,8 +392,10 @@ def generate_report(alerts, current_rates, date, pboc_rates, pboc_deviations, ll
     
     if pboc_rates:
         lines.append("  🏦 TAUX OFFICIELS PBOC (taux de référence central) :")
-        for ccy, rate in pboc_rates.items():
-            lines.append(f"    {ccy}/CNY : {rate:.4f}")
+        for ccy, data in pboc_rates.items():
+            rate = data.get("rate", "N/A")
+            date_str = data.get("date", "inconnue")
+            lines.append(f"    {ccy} : {rate:.4f} (dernière valeur du {date_str})")
         lines.append("")
     
     lines.append("-" * 70)
@@ -365,7 +415,7 @@ def generate_report(alerts, current_rates, date, pboc_rates, pboc_deviations, ll
         lines.append("-" * 70)
         for d in pboc_deviations:
             direction = "au-dessus du" if d["deviation_pct"] > 0 else "en dessous du"
-            lines.append(f"  • {d['currency']} : écart de {abs(d['deviation_pct']):.2f}% {direction} taux officiel PBOC")
+            lines.append(f"  • {d['pair']} : écart de {abs(d['deviation_pct']):.2f}% {direction} taux officiel PBOC")
         lines.append("")
     
     if llm_analysis:
